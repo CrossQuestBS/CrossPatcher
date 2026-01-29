@@ -35,8 +35,6 @@ namespace Patch.CrossPatcher
 
             var zenject = assemblyPath.FirstOrDefault(t => t.path.Contains("Zenject-usage.dll"));
             
-           
-            
             foreach (var modAssembly in modAssemblies)
             {
                 Resolver = new DefaultAssemblyResolver();
@@ -129,7 +127,6 @@ namespace Patch.CrossPatcher
 
             var instruction = method.Body.Instructions[0];
             
-
             var hasResultByRef =
                 patchMethod.Parameters.Any(it => it.Name == "__result" && it.ParameterType.IsByReference);
 
@@ -144,7 +141,6 @@ namespace Patch.CrossPatcher
             
             if (method.ReturnType.IsByReference)
             {
-                
                 ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldc_I4_1));
                 ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Newarr, method.ReturnType.GetElementType()));
                 ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldc_I4_0));
@@ -154,26 +150,29 @@ namespace Patch.CrossPatcher
             
             var hasBoolReturn = patchMethod.ReturnType.Name.ToLower().StartsWith("bool");
             
+
+            int idx = 0;
+            foreach (var VARIABLE in patchMethod.Parameters.ToArray().Where(it => !it.Name.Contains("__result")))
+            {
+                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldarg, idx));
+                idx++;
+            }
             
             if (hasResultByRef)
                 ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldloca, localResultVariable));
-            
-            if (patchMethod.Parameters.Count > 0 && patchMethod.Parameters[0].Name.Contains("_instance"))
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldarg_0));
+
             
             ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Call, reference));
 
-            if (hasBoolReturn)
+            if (!hasBoolReturn) return;
+            ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Brtrue, instruction));
+            
+            if (hasResultByRef)
             {
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Brtrue, instruction));
-                if (hasResultByRef)
-                {
-                    ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldloc, localResultVariable));
-                }
-
-              
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ret));
+                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldloc, localResultVariable));
             }
+                
+            ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ret));
         }
         
         
