@@ -27,7 +27,7 @@ namespace Patch.CrossPatcher
                     Debug.Log("Removing file: " + potentialFile);
                     File.Delete(potentialFile);
                     Debug.Log("Replacing with : " + file);
-                    File.Copy(file, potentialFile);
+                    File.Copy(file, potentialFile, true);
                 }
 
             }
