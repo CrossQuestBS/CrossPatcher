@@ -16,48 +16,114 @@ namespace Patch.CrossPatcher
     public class Patcher : IPostBuildPlayerScriptDLLs
     {
         public int callbackOrder => 0;
+        private DefaultAssemblyResolver _resolver;
 
-        public DefaultAssemblyResolver Resolver = new DefaultAssemblyResolver();
-        
-    
-        public static string FirstCharToLowerCase(string str)
+        private static string ToCamelCase(string str)
         {
-            if ( !string.IsNullOrEmpty(str) && char.IsUpper(str[0]))
+            if (!string.IsNullOrEmpty(str) && char.IsUpper(str[0]))
                 return str.Length == 1 ? char.ToLower(str[0]).ToString() : char.ToLower(str[0]) + str[1..];
 
             return str;
+        }
+
+        public void InitializeResolver(string assemblyParentPath)
+        {
+            _resolver = new DefaultAssemblyResolver();
+
+            _resolver.AddSearchDirectory(assemblyParentPath);
+        }
+
+        private AssemblyDefinition ReadAssembly(string path)
+        {
+            return AssemblyDefinition.ReadAssembly(path,
+                new ReaderParameters { ReadWrite = true, InMemory = true, AssemblyResolver = _resolver });
         }
         
         public void OnPostBuildPlayerScriptDLLs(BuildReport report)
         {
             var assemblyPath = report.GetFiles();
-            var modAssemblies = assemblyPath.Where(it => Path.GetFileName(it.path).StartsWith("Mod.") && it.path.EndsWith(".dll"));
+            var modAssemblies = assemblyPath.Where(it =>
+                Path.GetFileName(it.path).StartsWith("Mod.") && it.path.EndsWith(".dll"));
 
             var zenject = assemblyPath.FirstOrDefault(t => t.path.Contains("Zenject-usage.dll"));
+
+            var assemblyParentPath = Directory.GetParent(zenject.path);
+
+            if (assemblyParentPath is null)
+            {
+                Debug.LogError("Failed to get parent path for: " + zenject);
+                return;
+            }
             
             foreach (var modAssembly in modAssemblies)
             {
-                Resolver = new DefaultAssemblyResolver();
-                var assemblyParentPath = Directory.GetParent(zenject.path);
+                InitializeResolver(assemblyParentPath.FullName);
+                using var zenjectAssembly = ReadAssembly(zenject.path);
 
-                if (assemblyParentPath is null)
-                {
-                    Debug.LogError("Failed to get parent path for: " + zenject.path);
-                    return;
-                }
-
-                Resolver.AddSearchDirectory(assemblyParentPath.FullName);
-                
-                using var zenjectAssembly = AssemblyDefinition.ReadAssembly(zenject.path,
-                    new ReaderParameters { ReadWrite = true, InMemory = true, AssemblyResolver = Resolver });
-                
-                Debug.Log("Trying on assembly: " + Path.GetFileName(modAssembly.path));
                 var mainAssemblyPath = modAssembly.path;
-                
-                using var assembly = AssemblyDefinition.ReadAssembly(mainAssemblyPath,
-                    new ReaderParameters { ReadWrite = true, InMemory = true, AssemblyResolver = Resolver });
+                using var assembly = ReadAssembly(mainAssemblyPath);
+
                 ApplyCrossPatch(assembly, zenjectAssembly, assemblyParentPath.FullName);
-                Resolver.Dispose();
+                _resolver.Dispose();
+            }
+        }
+
+        private void ApplyCrossPatch(AssemblyDefinition modAssembly, AssemblyDefinition zenject, string rootPath)
+        {
+            var crossPatchTypes = modAssembly.MainModule.Types.Where(it =>
+                it.HasInterfaces && it.Interfaces.Any(it => it.InterfaceType.Name.Contains("ICrossPatch"))).ToArray();
+
+            if (crossPatchTypes.Length == 0)
+                return;
+
+            var zenjectAttribute = zenject.GetType("InjectAttribute");
+            var zenjectAttributeCtor = zenjectAttribute.Methods.FirstOrDefault(t => t.IsConstructor);
+
+            foreach (var crossPatchType in crossPatchTypes)
+            {
+                var patchedMethods = crossPatchType.Methods
+                    .Where(m => m.GetCustomAttribute("CrossPatchAttribute") is not null).ToArray();
+
+                foreach (var hookMethod in patchedMethods)
+                {
+                    // Check if attribute is on the object
+                    var patchAttribute = hookMethod.GetCustomAttribute("CrossPatchAttribute");
+
+                    if (patchAttribute is null)
+                        continue;
+
+                    var assembliesOpen = new Dictionary<string, AssemblyDefinition>();
+
+                    // Parse patch attribute
+                    var patchTypeReference = (TypeReference)patchAttribute.ConstructorArguments[0].Value;
+                    var methodName = (string)patchAttribute.ConstructorArguments[1].Value;
+                    var customAttributeArguments = patchAttribute.ConstructorArguments[2].Value;
+
+                    // Get assembly to patch
+                    var patchAssemblyPath =
+                        Path.Join(rootPath, GetResolvedTypeAssemblyName(patchTypeReference) + ".dll");
+                    var patchAssembly = GetAssemblyDefinition(patchAssemblyPath, assembliesOpen);
+
+                    var patchType = patchAssembly.GetType(patchTypeReference.Name);
+                    var patchMethod = patchType.GetMethod(methodName);
+
+
+                    if (customAttributeArguments is CustomAttributeArgument[] injectTypes)
+                    {
+                        InjectFields(rootPath, injectTypes, assembliesOpen, zenjectAttributeCtor, patchType);
+                    }
+
+                    HandlePatchAttribute(patchMethod, hookMethod);
+
+                    patchAssembly.Write(patchAssemblyPath);
+
+                    foreach (var assembly in assembliesOpen.Values)
+                    {
+                        assembly.Dispose();
+                    }
+
+                    assembliesOpen.Clear();
+                }
             }
         }
 
@@ -69,190 +135,172 @@ namespace Patch.CrossPatcher
             return name.Name;
         }
 
-        private void InjectField(TypeDefinition injectField, MethodDefinition zenjectAttributeCtor, TypeDefinition instance)
+        private void InjectField(TypeDefinition field, MethodDefinition zenjectAttributeMethod, TypeDefinition type)
         {
+            var injectFieldName = $"_{ToCamelCase(field.Name)}";
 
-            var newFieldName = $"_{FirstCharToLowerCase(injectField.Name)}";
-            if (instance.Fields.Any(it => it.Name == newFieldName))
+            if (type.Fields.Any(it => it.Name == injectFieldName))
                 return;
-            
-            var newField = new FieldDefinition(newFieldName, FieldAttributes.Private, injectField);
-            instance.Fields.Add(newField);
-            
-            var attributeCtorRef = instance.Module.ImportReference(zenjectAttributeCtor);
-            var injectAttribute = new CustomAttribute(attributeCtorRef);
-            newField.CustomAttributes.Add(injectAttribute);
+
+            var newField = new FieldDefinition(injectFieldName, FieldAttributes.Private, field);
+            type.Fields.Add(newField);
+
+            newField.CustomAttributes.Add(new CustomAttribute(type.Module.ImportReference(zenjectAttributeMethod)));
         }
 
-        private AssemblyDefinition GetAssemblyDefinition(string path, Dictionary<string, AssemblyDefinition> assembliesOpen)
+        private AssemblyDefinition GetAssemblyDefinition(string path,
+            Dictionary<string, AssemblyDefinition> assembliesOpen)
         {
             if (assembliesOpen.TryGetValue(path, out var definition))
             {
                 return definition;
             }
-            
-            var assembly = AssemblyDefinition.ReadAssembly(path,
-                new ReaderParameters { ReadWrite = true, InMemory = true, AssemblyResolver = Resolver });
-            
+
+            var assembly = ReadAssembly(path);
+
             assembliesOpen.Add(path, assembly);
 
             return assembly;
         }
-        
+
         private void ApplyPostFix(MethodDefinition method, MethodDefinition patchMethod)
         {
             Debug.Log("Running Postfix on: " + method.FullName);
 
             var ilProcessor = method.Body.GetILProcessor();
             var reference = method.Module.ImportReference(patchMethod);
-                    
-            // Removes return
+
             ilProcessor.Remove(method.Body.Instructions.Last());
-            
-            for (int i = 0; i < patchMethod.Parameters.Count; i++)
+
+            for (var i = 0; i < patchMethod.Parameters.Count; i++)
             {
                 ilProcessor.Emit(OpCodes.Ldarg, i);
             }
-            
+
             ilProcessor.Emit(OpCodes.Call, reference);
             ilProcessor.Emit(OpCodes.Ret);
         }
 
+        private VariableDefinition CreateLocalResultVariable(MethodDefinition method, ILProcessor ilProcessor,
+            Instruction instruction)
+        {
+            VariableDefinition localResultVariable = new VariableDefinition(method.ReturnType);
+            method.Body.Variables.Add(localResultVariable);
+            if (!method.ReturnType.IsByReference) return localResultVariable;
+
+            Instruction[] instructions =
+            {
+                ilProcessor.Create(OpCodes.Ldc_I4_1),
+                ilProcessor.Create(OpCodes.Newarr, method.ReturnType.GetElementType()),
+                ilProcessor.Create(OpCodes.Ldc_I4_0),
+                ilProcessor.Create(OpCodes.Ldelem_Ref, method.ReturnType.GetElementType()),
+                ilProcessor.Create(OpCodes.Stloc, localResultVariable),
+            };
+            
+            foreach (var newInstruction in instructions)
+            {
+                ilProcessor.InsertBefore(instruction, newInstruction);
+            }
+        
+            return localResultVariable;
+        }
+
+        private void InsertPrefixPatchStack(MethodDefinition patchMethod, ILProcessor ilProcessor,
+            Instruction instruction, bool hasReturnParameter, VariableDefinition localResultVariable)
+        {
+            var parameters = patchMethod.Parameters.ToArray().Where(it => !it.Name.Contains("__result")).ToArray();
+
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                ilProcessor.InsertBefore(instruction, 
+                    ilProcessor.Create(OpCodes.Ldarg, i));
+            }
+
+            if (hasReturnParameter)
+                ilProcessor.InsertBefore(instruction, 
+                    ilProcessor.Create(OpCodes.Ldloca, localResultVariable));
+        }
+
+
+        private static void HandlePrefixReturn(ILProcessor ilProcessor, Instruction instruction,
+            bool hasReturnParameter,
+            VariableDefinition localResultVariable)
+        {
+            ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Brtrue, instruction));
+
+            if (hasReturnParameter)
+            {
+                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldloc, localResultVariable));
+            }
+
+            ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ret));
+        }
+
         private void ApplyPrefix(MethodDefinition method, MethodDefinition patchMethod)
         {
-            Debug.Log("Running Prefix on: " + method.FullName);
-
             var ilProcessor = method.Body.GetILProcessor();
             var reference = method.Module.ImportReference(patchMethod);
 
             var instruction = method.Body.Instructions[0];
-            
-            var hasResultByRef =
+
+            var hasReturnParameter =
                 patchMethod.Parameters.Any(it => it.Name == "__result" && it.ParameterType.IsByReference);
 
+            var localResultVariable =
+                hasReturnParameter ? CreateLocalResultVariable(method, ilProcessor, instruction) : null;
 
-            VariableDefinition localResultVariable = null;
-
-            if (hasResultByRef)
-            {
-                localResultVariable = new VariableDefinition(method.ReturnType);
-                method.Body.Variables.Add(localResultVariable);
-            }
-            
-            if (method.ReturnType.IsByReference)
-            {
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldc_I4_1));
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Newarr, method.ReturnType.GetElementType()));
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldc_I4_0));
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldelem_Ref, method.ReturnType.GetElementType()));
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Stloc, localResultVariable));
-            }
-            
             var hasBoolReturn = patchMethod.ReturnType.Name.ToLower().StartsWith("bool");
-            
 
-            int idx = 0;
-            foreach (var VARIABLE in patchMethod.Parameters.ToArray().Where(it => !it.Name.Contains("__result")))
-            {
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldarg, idx));
-                idx++;
-            }
-            
-            if (hasResultByRef)
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldloca, localResultVariable));
+            InsertPrefixPatchStack(patchMethod, ilProcessor, instruction, hasReturnParameter, localResultVariable);
 
-            
             ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Call, reference));
 
-            if (!hasBoolReturn) return;
-            ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Brtrue, instruction));
-            
-            if (hasResultByRef)
-            {
-                ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ldloc, localResultVariable));
-            }
-                
-            ilProcessor.InsertBefore(instruction, ilProcessor.Create(OpCodes.Ret));
+            if (hasBoolReturn)
+                HandlePrefixReturn(ilProcessor, instruction, hasReturnParameter, localResultVariable);
         }
-        
-        
-        private void ApplyCrossPatch(AssemblyDefinition modAssembly, AssemblyDefinition zenject, string rootPath)
+
+        private void HandlePatchAttribute(MethodDefinition methodToPatch, MethodDefinition hookMethod)
         {
-            var types = modAssembly.MainModule.Types.Where(it => it.HasInterfaces && it.Interfaces.Any(it => it.InterfaceType.Name.Contains("ICrossPatch")));
-            var zenjectAttribute = PatchUtils.GetType(zenject, "InjectAttribute");
-            var zenjectAttributeCtor = zenjectAttribute.Methods.FirstOrDefault(t => t.IsConstructor);
-            
-            foreach (var type in types)
+            string[] patchAttributes = { "CrossPostfixAttribute", "CrossPrefixAttribute" };
+            var attributes = hookMethod.GetCustomAttributes(patchAttributes);
+
+            if (attributes.Length == 0)
+                return;
+
+            if (attributes.Length > 1)
+                throw new Exception("Expected either Postfix or Prefix attribute, got both");
+
+            var attributeName = attributes[0].GetAttributeTypeName();
+
+            switch (attributeName)
             {
-                Debug.Log("Trying on type: " + type.FullName);
-
-                var patchedMethods = type.Methods.Where(m => m.CustomAttributes.Any(ca => ca.AttributeType.Name == "CrossPatchAttribute")).ToArray();
-
-                foreach (var hookMethod in patchedMethods)
-                {
-                    Dictionary<string, AssemblyDefinition> assembliesOpen = new Dictionary<string, AssemblyDefinition>();
-
-                    Debug.Log("Trying on patched Method: " + hookMethod.FullName);
-
-                    var attribute = hookMethod.CustomAttributes.FirstOrDefault(it => it.AttributeType.Name == "CrossPatchAttribute");
-
-                    if (attribute is null)
-                        continue;
-                    
-                    var instanceTypeReference = (TypeReference)attribute.ConstructorArguments[0].Value;
-                    
-                    Debug.Log("Type: " + instanceTypeReference.FullName);
-                    
-                    var instanceAssemblyPath =
-                        Path.Join(rootPath, GetResolvedTypeAssemblyName(instanceTypeReference) + ".dll");
-                    var instanceAssembly = GetAssemblyDefinition(instanceAssemblyPath, assembliesOpen);
-                    var instanceType = PatchUtils.GetType(instanceAssembly, instanceTypeReference.Name); 
-                    
-                    
-                    // Injecting!
-                    
-                    if (attribute.ConstructorArguments[2].Value is CustomAttributeArgument[] injectTypes)
-                    {
-                        foreach (var argumentType in injectTypes)
-                        {
-                            if (argumentType.Value is not TypeReference injectedTypeReference)
-                                continue;
-
-                            var assemblyName = GetResolvedTypeAssemblyName(injectedTypeReference);
-                            var assemblyPath = Path.Join(rootPath, assemblyName + ".dll");
-                        
-                            var assembly = GetAssemblyDefinition(assemblyPath, assembliesOpen);
-                            var injectedType = PatchUtils.GetType(assembly, injectedTypeReference.Name);
-                        
-                            InjectField(injectedType, zenjectAttributeCtor, instanceType);
-                        }
-                    }
-
-                    var methodName = (string)attribute.ConstructorArguments[1].Value;
-                    var methodToPatch = PatchUtils.GetMethod(instanceType, methodName);
-
-                    // If is POSTFIX
-                    if (hookMethod.CustomAttributes.Any(it => it.AttributeType.Name == "CrossPostfixAttribute"))
-                    {
-
-                        ApplyPostFix(methodToPatch, hookMethod);
-                    }
-
-                    if (hookMethod.CustomAttributes.Any(it => it.AttributeType.Name == "CrossPrefixAttribute"))
-                    {
-                        ApplyPrefix(methodToPatch, hookMethod);
-                    }
-                    
-                    instanceAssembly.Write(instanceAssemblyPath);
-                    foreach (var assembly in assembliesOpen.Values)
-                    {
-                        assembly.Dispose();
-                    }
-                    assembliesOpen.Clear();
-                }
-                
+                case "CrossPostfixAttribute":
+                    ApplyPostFix(methodToPatch, hookMethod);
+                    break;
+                case "CrossPrefixAttribute":
+                    ApplyPrefix(methodToPatch, hookMethod);
+                    break;
             }
-            
+        }
+
+
+        private void InjectFields(string rootPath, CustomAttributeArgument[] injectTypes,
+            Dictionary<string, AssemblyDefinition> assembliesOpen,
+            MethodDefinition zenjectAttributeCtor, TypeDefinition instanceType)
+        {
+            foreach (var argumentType in injectTypes)
+            {
+                if (argumentType.Value is not TypeReference injectedTypeReference)
+                    continue;
+
+                var assemblyName = GetResolvedTypeAssemblyName(injectedTypeReference);
+                var assemblyPath = Path.Join(rootPath, assemblyName + ".dll");
+
+                var assembly = GetAssemblyDefinition(assemblyPath, assembliesOpen);
+                var injectedType = assembly.GetType(injectedTypeReference.Name);
+
+                InjectField(injectedType, zenjectAttributeCtor, instanceType);
+            }
         }
     }
 }

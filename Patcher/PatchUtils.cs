@@ -1,12 +1,29 @@
+using System.Collections.ObjectModel;
 using System.Linq;
 using Mono.Cecil;
 using UnityEngine;
 
 namespace  Patch.CrossPatcher
 {
-    public class PatchUtils
+    public static class PatchUtils
     {
-        public static TypeDefinition GetType(AssemblyDefinition asm, string name)
+
+        public static string GetAttributeTypeName(this CustomAttribute attribute)
+        {
+            return attribute.AttributeType.Name;
+        }
+        
+        public static CustomAttribute GetCustomAttribute(this MethodDefinition method, string name)
+        {
+            return method.CustomAttributes.FirstOrDefault(it => it.AttributeType.Name == name);
+        }
+        
+        public static CustomAttribute[] GetCustomAttributes(this MethodDefinition method, string[] names)
+        {
+            return method.CustomAttributes.Where(it => names.Contains(it.AttributeType.Name)).ToArray();
+        }
+        
+        public static TypeDefinition GetType(this AssemblyDefinition asm, string name)
         {
             var type = asm.MainModule.Types.FirstOrDefault(t => t.Name == name);
 
@@ -16,7 +33,7 @@ namespace  Patch.CrossPatcher
             return type;
         }
 
-        public static MethodDefinition GetMethod(TypeDefinition typeDef, string methodName)
+        public static MethodDefinition GetMethod(this TypeDefinition typeDef, string methodName)
         {
             var method = typeDef.Methods.FirstOrDefault(t => t.Name == methodName);
             if (method is  null)
