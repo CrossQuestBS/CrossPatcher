@@ -46,7 +46,7 @@ namespace CrossPatcherBuild
 
             var modFolderFiles = Directory.GetFiles(modfolder).Select(modFilePath => Path.GetFileName(modFilePath)).Where(it => it.EndsWith(".dll")).ToList();
             
-            Debug.LogWarning("Found files: " + string.Join(",", modFolderFiles));
+            Debug.Log("Found files: " + string.Join(",", modFolderFiles));
             var modAssemblies = assemblyPath.Where(it =>
                 it.path.EndsWith(".dll") && modFolderFiles.Any(modFile => modFile == Path.GetFileName(it.path)));
             
