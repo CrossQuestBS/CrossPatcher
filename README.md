@@ -1,0 +1,16 @@
+# CrossPatcher
+
+## Setting up
+
+Add this to the project
+
+**CrossPatcher.csproj.user**   
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <!-- SET *YOUR OWN* UNITY EDITOR DIRECTORY HERE TO RESOLVE MOST DEPENDECY PATHS! -->
+    <UnityEngineManagedDir>...\Managed\UnityEngine<UnityEngineManagedDir>
+  </PropertyGroup>
+</Project>
+```
